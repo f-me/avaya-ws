@@ -5,6 +5,7 @@ import Control.Applicative
 import Control.Monad
 import Control.Monad.IO.Class
 import qualified Data.ByteString.Lazy.Char8 as L
+import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import qualified Data.Map as Map
@@ -24,7 +25,7 @@ import qualified Avaya.Messages.Request as Rq
 
 data Config = Config
   {listenPort :: Int
-  ,aesAddr    :: Text
+  ,aesAddr    :: String
   ,aesPort    :: Int
   ,aesUser    :: Text
   ,aesPass    :: Text
@@ -33,7 +34,7 @@ data Config = Config
 
 
 main :: IO ()
-main = getArgs >>= case of
+main = getArgs >>= \case
   [config] -> realMain config
   _ -> putStrLn "Usage: avaya-ws <path to config>"
 
@@ -57,7 +58,7 @@ realMain config = do
 type AvayaMap = TVar (Map.Map (Text,Text) (LoopHandle,MonitoringHandle))
 
 
-chkRequestPath :: Request -> WebSockets a (Text,Text)
+chkRequestPath :: Request -> WebSockets Hybi00 (Text,Text)
 chkRequestPath rq
   = case T.splitOn "/" . T.decodeUtf8 $ requestPath rq of
     ["", "avaya", ext, pwd] -> return (ext, pwd)
@@ -78,20 +79,20 @@ rqHandler cfg cMapVar rq = do
   acceptRequest rq
   s <- getSink
   liftIO $ attachObserver h $ evHandler s
-  catchWsError (forever $ loop h m) shutdown
 
+  let loop
+        = receive >>= \case
+          DataMessage (Text t) -> runCommand h m t
+          _ -> return () -- FIXME: log
 
-shutdown e = liftIO $ do
-  putStrLn $ "Sutdown session " ++ show (sessionId m)
-  atomically $ modifyTVar' cMapVar $ Map.delete (ext,pwd)
-  stopDeviceMonitoring h m
-  shutdownLoop h
+  let shutdown e = liftIO $ do
+        putStrLn $ "Sutdown session " ++ show (sessionId m)
+        atomically $ modifyTVar' cMapVar $ Map.delete (ext,pwd)
+        stopDeviceMonitoring h m
+        shutdownLoop h
 
+  catchWsError (forever loop) shutdown
 
-loop h m ext pwd
-  = receive >>= case of
-    DataMessage (Text t) -> runCommand h m t
-    _ -> return () -- FIXME: log
 
 runCommand h m t
   = case L.split ':' t of
@@ -114,7 +115,7 @@ runCommand h m t
       _ -> return ()
 
 
-evHandler ws ev = case ev of
+evHandler ws = \case
   AvayaRsp rsp -> case rsp of
     Rs.RingerStatusEvent{..} -> sendSink ws $ textData $ L.fromChunks
       ["{\"type\":\"ringer\",\"ringer\":\""
@@ -133,11 +134,11 @@ evHandler ws ev = case ev of
 -- startMonitoring :: Config -> Text -> Text -> Int -> Char
 startMonitoring (Config{..}) ext pwd rq
   = (liftIO $ startMessageLoop aesAddr aesPort)
-    >>= case of
+    >>= \case
       Left _ -> rejectRequest rq "Can't start session"
       Right h ->
         (liftIO $ startDeviceMonitoring h aesUser aesPass aesSwitch ext pwd)
-          >>= case of
+          >>= \case
             Left _ -> rejectRequest rq "Can't register device"
             Right m -> return $ Right (h,m)
         -- liftIO $ attachObserver h print

@@ -32,4 +32,5 @@ executable avaya-ws
                        avaya-aes  == 0.0.5
   extensions:
                        OverloadedStrings,
-                       RecordWildCards
+                       RecordWildCards,
+                       LambdaCase
