@@ -4,9 +4,6 @@ module Main where
 import Control.Applicative
 import Control.Monad
 import Control.Monad.IO.Class
-import Control.Monad.Trans
-import Control.Error
-import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy.Char8 as L
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
@@ -81,22 +78,20 @@ rqHandler cfg cMapVar rq = do
   acceptRequest rq
   s <- getSink
   liftIO $ attachObserver h $ evHandler s
-  void $ runEitherT $ forever $ loop h m ext pwd
+  catchWsError (forever $ loop h m) shutdown
 
 
-loop h m ext pwd = do
-  msg <- lift receive
-  case msg of
-    ControlMessage (Close _) -> do
-      liftIO $ do
-        putStrLn $ "Sutdown session " ++ show (sessionId m)
-        atomically $ modifyTVar' cMapVar $ Map.delete (ext,pwd)
-        stopDeviceMonitoring h m
-        shutdownLoop h
-      left ()
+shutdown e = liftIO $ do
+  putStrLn $ "Sutdown session " ++ show (sessionId m)
+  atomically $ modifyTVar' cMapVar $ Map.delete (ext,pwd)
+  stopDeviceMonitoring h m
+  shutdownLoop h
 
+
+loop h m ext pwd
+  = receive >>= case of
     DataMessage (Text t) -> runCommand h m t
-    _ -> return ()
+    _ -> return () -- FIXME: log
 
 runCommand h m t
   = case L.split ':' t of
@@ -117,6 +112,7 @@ runCommand h m t
             ,hookswitchOnhook = False
             }
       _ -> return ()
+
 
 evHandler ws ev = case ev of
   AvayaRsp rsp -> case rsp of
