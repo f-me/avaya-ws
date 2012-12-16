@@ -1,6 +1,7 @@
 
 module Main where
 
+import Control.Applicative
 import Control.Monad
 import Control.Monad.IO.Class
 import Control.Monad.Trans
@@ -15,6 +16,7 @@ import System.Environment (getArgs)
 import Control.Concurrent
 import Control.Concurrent.STM
 import Network.WebSockets
+import qualified Data.Configurator as Cfg
 
 import Avaya.Actions
 import Avaya.MessageLoop
@@ -22,69 +24,90 @@ import Avaya.DeviceMonitoring
 import qualified Avaya.Messages.Response as Rs
 import qualified Avaya.Messages.Request as Rq
 
-main = do
-  args <- getArgs
-  case args of
-    [portNum] -> runWebSockServer "0.0.0.0" $ read portNum
-    _ -> putStrLn "Usage: avaya-ws <port number to listen>"
+
+data Config = Config
+  {listenPort :: Int
+  ,aesAddr    :: Text
+  ,aesPort    :: Int
+  ,aesUser    :: Text
+  ,aesPass    :: Text
+  ,aesSwitch  :: Text
+  }
 
 
--- FIXME: credentials to config
-runWebSockServer :: String -> Int -> IO ()
-runWebSockServer ip port = do
+main :: IO ()
+main = getArgs >>= case of
+  [config] -> realMain config
+  _ -> putStrLn "Usage: avaya-ws <path to config>"
+
+
+realMain :: FilePath -> IO ()
+realMain config = do
+  c <- Cfg.load [Cfg.Required config]
+  cfg <- Config
+      <$> Cfg.require c "listen-port"
+      <*> Cfg.require c "aes-addr"
+      <*> Cfg.require c "aes-port"
+      <*> Cfg.require c "aes-user"
+      <*> Cfg.require c "aes-pass"
+      <*> Cfg.require c "aes-switch"
+
   connMap <- newTVarIO Map.empty
-  void $ forkIO $ runServer ip port (rqHandler connMap)
+  runServer "0.0.0.0" (listenPort cfg)
+    $ rqHandler cfg connMap
+
 
 type AvayaMap
   = TVar (Map.Map
-    (B.ByteString,B.ByteString)
+    (Text,Text)
     (LoopHandle,MonitoringHandle))
 
-rqHandler :: AvayaMap -> Request -> WebSockets Hybi00 ()
-rqHandler cMapVar rq = case B.split '/' $ requestPath rq of
-  ["","avaya",ext,pwd] -> do
-    cMap <- liftIO $ readTVarIO cMapVar
-    Right (h,m) <- case Map.lookup (ext,pwd) cMap of
-      Just hm -> return $ Right hm
-      Nothing -> startMonitoring rq ext pwd
-    liftIO $ atomically
-      $ writeTVar cMapVar $! Map.insert (ext,pwd) (h,m) cMap
+rqHandler :: Config -> AvayaMap -> Request -> WebSockets Hybi00 ()
+rqHandler cfg cMapVar rq
+  = case T.splitOn "/" . T.decodeUtf8 $ requestPath rq of
+    ["","avaya",ext,pwd] -> do
+      cMap <- liftIO $ readTVarIO cMapVar
+      Right (h,m) <- case Map.lookup (ext,pwd) cMap of
+        Just hm -> return $ Right hm
+        Nothing -> startMonitoring cfg ext pwd rq
+      liftIO $ atomically
+        $ writeTVar cMapVar $! Map.insert (ext,pwd) (h,m) cMap
 
-    acceptRequest rq
-    s <- getSink
-    liftIO $ attachObserver h $ evHandler s
-    void $ runEitherT $ forever $ do
-      msg <- lift receive
-      case msg of
-        ControlMessage (Close _) -> do
-          liftIO $ do
-            putStrLn $ "Sutdown session " ++ show (sessionId m)
-            atomically $ modifyTVar' cMapVar $ Map.delete (ext,pwd)
-            stopDeviceMonitoring h m
-            shutdownLoop h
-          left ()
+      acceptRequest rq
+      s <- getSink
+      liftIO $ attachObserver h $ evHandler s
+      void $ runEitherT $ forever $ do
+        msg <- lift receive
+        case msg of
+          ControlMessage (Close _) -> do
+            liftIO $ do
+              putStrLn $ "Sutdown session " ++ show (sessionId m)
+              atomically $ modifyTVar' cMapVar $ Map.delete (ext,pwd)
+              stopDeviceMonitoring h m
+              shutdownLoop h
+            left ()
 
-        DataMessage (Text t) -> case L.split ':' t of
-          ["dial", number] -> liftIO $ do
-            sendRequestSync h
-              $ Rq.SetHookswitchStatus
-                {acceptedProtocol = actualProtocolVersion m
-                ,device = deviceId m
-                ,hookswitchOnhook = False
-                }
-            dialNumber h (actualProtocolVersion m) (deviceId m) (L.unpack number)
+          DataMessage (Text t) -> case L.split ':' t of
+            ["dial", number] -> liftIO $ do
+              sendRequestSync h
+                $ Rq.SetHookswitchStatus
+                  {acceptedProtocol = actualProtocolVersion m
+                  ,device = deviceId m
+                  ,hookswitchOnhook = False
+                  }
+              dialNumber h (actualProtocolVersion m) (deviceId m) (L.unpack number)
 
-          ["acceptCall"]
-            -> liftIO $ sendRequestAsync h
-              $ Rq.SetHookswitchStatus
-                {acceptedProtocol = actualProtocolVersion m
-                ,device = deviceId m
-                ,hookswitchOnhook = False
-                }
+            ["acceptCall"]
+              -> liftIO $ sendRequestAsync h
+                $ Rq.SetHookswitchStatus
+                  {acceptedProtocol = actualProtocolVersion m
+                  ,device = deviceId m
+                  ,hookswitchOnhook = False
+                  }
+            _ -> return ()
           _ -> return ()
-        _ -> return ()
 
-  _ -> rejectRequest rq "401"
+    _ -> rejectRequest rq "401"
 
 
 evHandler ws ev = case ev of
@@ -103,15 +126,14 @@ evHandler ws ev = case ev of
   _ -> return ()
 
 
-startMonitoring rq ext pwd = do
-  res <- liftIO $ startMessageLoop "192.168.20.5" 4721
-  case res of
-    Left _ -> rejectRequest rq "Can't start session"
-    Right h -> do
-      -- liftIO $ attachObserver h print
-      res <- liftIO $ startDeviceMonitoring h
-        "avaya" "avayapassword" "S8300ADAC"
-        (T.decodeUtf8 ext) (T.decodeUtf8 pwd)
-      case res of
-        Left _ -> rejectRequest rq "Can't register device"
-        Right m -> return $ Right (h,m)
+-- startMonitoring :: Config -> Text -> Text -> Int -> Char
+startMonitoring (Config{..}) ext pwd rq
+  = (liftIO $ startMessageLoop aesAddr aesPort)
+    >>= case of
+      Left _ -> rejectRequest rq "Can't start session"
+      Right h ->
+        (liftIO $ startDeviceMonitoring h aesUser aesPass aesSwitch ext pwd)
+          >>= case of
+            Left _ -> rejectRequest rq "Can't register device"
+            Right m -> return $ Right (h,m)
+        -- liftIO $ attachObserver h print
