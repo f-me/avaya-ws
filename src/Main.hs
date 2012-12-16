@@ -57,58 +57,66 @@ realMain config = do
     $ rqHandler cfg connMap
 
 
-type AvayaMap
-  = TVar (Map.Map
-    (Text,Text)
-    (LoopHandle,MonitoringHandle))
+type AvayaMap = TVar (Map.Map (Text,Text) (LoopHandle,MonitoringHandle))
 
-rqHandler :: Config -> AvayaMap -> Request -> WebSockets Hybi00 ()
-rqHandler cfg cMapVar rq
+
+chkRequestPath :: Request -> WebSockets a (Text,Text)
+chkRequestPath rq
   = case T.splitOn "/" . T.decodeUtf8 $ requestPath rq of
-    ["","avaya",ext,pwd] -> do
-      cMap <- liftIO $ readTVarIO cMapVar
-      Right (h,m) <- case Map.lookup (ext,pwd) cMap of
-        Just hm -> return $ Right hm
-        Nothing -> startMonitoring cfg ext pwd rq
-      liftIO $ atomically
-        $ writeTVar cMapVar $! Map.insert (ext,pwd) (h,m) cMap
-
-      acceptRequest rq
-      s <- getSink
-      liftIO $ attachObserver h $ evHandler s
-      void $ runEitherT $ forever $ do
-        msg <- lift receive
-        case msg of
-          ControlMessage (Close _) -> do
-            liftIO $ do
-              putStrLn $ "Sutdown session " ++ show (sessionId m)
-              atomically $ modifyTVar' cMapVar $ Map.delete (ext,pwd)
-              stopDeviceMonitoring h m
-              shutdownLoop h
-            left ()
-
-          DataMessage (Text t) -> case L.split ':' t of
-            ["dial", number] -> liftIO $ do
-              sendRequestSync h
-                $ Rq.SetHookswitchStatus
-                  {acceptedProtocol = actualProtocolVersion m
-                  ,device = deviceId m
-                  ,hookswitchOnhook = False
-                  }
-              dialNumber h (actualProtocolVersion m) (deviceId m) (L.unpack number)
-
-            ["acceptCall"]
-              -> liftIO $ sendRequestAsync h
-                $ Rq.SetHookswitchStatus
-                  {acceptedProtocol = actualProtocolVersion m
-                  ,device = deviceId m
-                  ,hookswitchOnhook = False
-                  }
-            _ -> return ()
-          _ -> return ()
-
+    ["", "avaya", ext, pwd] -> return (ext, pwd)
     _ -> rejectRequest rq "401"
 
+
+rqHandler :: Config -> AvayaMap -> Request -> WebSockets Hybi00 ()
+rqHandler cfg cMapVar rq = do
+  (ext,pwd) <- chkRequestPath rq
+
+  cMap <- liftIO $ readTVarIO cMapVar
+  Right (h,m) <- case Map.lookup (ext,pwd) cMap of
+    Just hm -> return $ Right hm
+    Nothing -> startMonitoring cfg ext pwd rq
+  liftIO $ atomically
+    $ writeTVar cMapVar $! Map.insert (ext,pwd) (h,m) cMap
+
+  acceptRequest rq
+  s <- getSink
+  liftIO $ attachObserver h $ evHandler s
+  void $ runEitherT $ forever $ loop h m ext pwd
+
+
+loop h m ext pwd = do
+  msg <- lift receive
+  case msg of
+    ControlMessage (Close _) -> do
+      liftIO $ do
+        putStrLn $ "Sutdown session " ++ show (sessionId m)
+        atomically $ modifyTVar' cMapVar $ Map.delete (ext,pwd)
+        stopDeviceMonitoring h m
+        shutdownLoop h
+      left ()
+
+    DataMessage (Text t) -> runCommand h m t
+    _ -> return ()
+
+runCommand h m t
+  = case L.split ':' t of
+      ["dial", number] -> liftIO $ do
+        sendRequestSync h
+          $ Rq.SetHookswitchStatus
+            {acceptedProtocol = actualProtocolVersion m
+            ,device = deviceId m
+            ,hookswitchOnhook = False
+            }
+        dialNumber h (actualProtocolVersion m) (deviceId m) (L.unpack number)
+
+      ["acceptCall"]
+        -> liftIO $ sendRequestAsync h
+          $ Rq.SetHookswitchStatus
+            {acceptedProtocol = actualProtocolVersion m
+            ,device = deviceId m
+            ,hookswitchOnhook = False
+            }
+      _ -> return ()
 
 evHandler ws ev = case ev of
   AvayaRsp rsp -> case rsp of
