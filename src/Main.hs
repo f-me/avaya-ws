@@ -109,7 +109,7 @@ rqHandler cfg cMapVar rq = do
 
   let shutdown e = liftIO $ do
         syslog Notice $ "WsError catched: " ++ show e
---        detachObserver h o
+        detachObserver h o
 
   catchWsError (forever loop) shutdown
 
